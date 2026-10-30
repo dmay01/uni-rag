@@ -55,6 +55,9 @@ class VectorStore:
             return set()
         return {row["id"] for row in self.table.search().select(["id"]).limit(None).to_list()}
 
+    def count(self) -> int:
+        return self.table.count_rows() if self.table is not None else 0
+
     def search(self, vector: list[float], k: int, eligible: set[str] | None = None) -> list[Chunk]:
         if self.table is None:
             return []

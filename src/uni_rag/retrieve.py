@@ -72,7 +72,10 @@ def retrieve(
         return []
     candidates = max(count, config.candidate_k)
     vector = client.embed([question])[0]
-    dense = [chunk.id for chunk in store.search(vector, candidates, set(eligible))]
+    # Eligible IDs come from this table. The common, fully active unfiltered corpus
+    # needs no potentially enormous SQL IN clause; partial files still stay excluded.
+    vector_filter = None if len(eligible) == store.count() else set(eligible)
+    dense = [chunk.id for chunk in store.search(vector, candidates, vector_filter)]
     sparse = keyword.search(question, candidates, set(eligible))
     scores: dict[str, float] = {}
     for ranking in (dense, sparse):
