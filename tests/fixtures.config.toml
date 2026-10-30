@@ -1,0 +1,11 @@
+# Synthetic-only development configuration; never points at personal documents.
+[[sources]]
+name = "fixtures"
+path = "./fixtures"
+
+[storage]
+data_dir = "../data/fixtures"
+
+[energy]
+energy_backend = "none"
+power_log = "../data/fixtures/power.log"

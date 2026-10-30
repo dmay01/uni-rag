@@ -1,0 +1,38 @@
+[project]
+name = "uni-rag"
+version = "0.1.0"
+description = "Transparent, fully local RAG over university documents"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "typer>=0.15",
+  "rich>=13.9",
+  "httpx>=0.28",
+  "lancedb>=0.20",
+  "pyarrow>=19",
+  "bm25s[indexing]>=0.2",
+  "PyMuPDF>=1.25,<2",
+  "python-pptx>=1.0",
+  "python-docx>=1.1",
+  "PyYAML>=6.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.3", "ruff>=0.11"]
+
+[project.scripts]
+rag = "uni_rag.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --basetemp=.cache/pytest"

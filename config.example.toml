@@ -1,0 +1,41 @@
+# Copy to config.toml and replace the placeholder paths. Never commit config.toml.
+[[sources]]
+name = "obsidian"
+path = "~/Library/Mobile Documents/iCloud~md~obsidian/Documents/YOUR_VAULT"
+
+[[sources]]
+name = "tuwien"
+path = "~/PATH/TO/TU_WIEN"
+
+[ingest]
+include_extensions = [".md", ".txt", ".pdf", ".pptx", ".docx", ".tex"]
+exclude_patterns = []
+max_file_mb = 50
+skip_cloud_only = true
+embedding_batch_size = 16
+
+[chunking]
+target_tokens = 500
+overlap_fraction = 0.15
+min_slide_tokens = 30
+
+[ollama]
+base_url = "http://localhost:11434"
+embedding_model = "bge-m3"
+chat_model = "qwen3:14b"
+chat_models = ["qwen3:4b", "qwen3:14b", "qwen3:30b-a3b"]
+timeout_seconds = 180
+
+[retrieval]
+top_k = 8
+candidate_k = 32
+rrf_constant = 60
+
+[storage]
+data_dir = "./data"
+
+[energy]
+energy_backend = "auto" # auto/macmon/powermetrics/none
+power_log = "./data/power.log"
+baseline_seconds = 3
+sample_interval_ms = 200
