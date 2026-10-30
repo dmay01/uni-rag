@@ -40,7 +40,13 @@ class Ollama:
         with self.client.stream(
             "POST",
             "/api/chat",
-            json={"model": model, "messages": messages, "stream": True, "think": think},
+            json={
+                "model": model,
+                "messages": messages,
+                "stream": True,
+                "think": think,
+                "options": {"num_ctx": self.config.context_window},
+            },
         ) as response:
             response.raise_for_status()
             for line in response.iter_lines():

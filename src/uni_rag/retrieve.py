@@ -5,7 +5,7 @@ import json
 from dataclasses import replace
 
 from uni_rag.config import Config
-from uni_rag.ingest.manifest import active_files
+from uni_rag.ingest.manifest import active_files, validate_index
 from uni_rag.models import Chunk, Hit
 from uni_rag.ollama import Ollama
 from uni_rag.store.keywords import KeywordStore
@@ -13,7 +13,8 @@ from uni_rag.store.vectors import VectorStore
 
 
 def active_chunks(config: Config, store: VectorStore) -> tuple[list[Chunk], str]:
-    files = active_files(config.data_dir)
+    configured = {source.name for source in config.sources}
+    files = [item for item in active_files(config.data_dir) if item["source"] in configured]
     by_hash: dict[str, list[dict]] = {}
     for item in files:
         by_hash.setdefault(item["sha1"], []).append(item)
@@ -52,6 +53,7 @@ def retrieve(
         config.selected_sources(source)
     if file_type:
         file_type = "." + file_type.lstrip(".").lower()
+    validate_index(config)
     store = VectorStore(config.data_dir / "index")
     chunks, revision = active_chunks(config, store)
     keyword = KeywordStore(config.data_dir / "bm25", chunks, revision)

@@ -73,17 +73,57 @@ def walk(
         if root.is_symlink():
             result.skip(src.name, ".", "symlink")
             continue
+        try:
+            root_info = root.stat(follow_symlinks=False)
+            if config.skip_cloud_only and getattr(root_info, "st_flags", 0) & SF_DATALESS:
+                result.skip(src.name, ".", "cloud_only")
+                continue
+        except OSError as exc:
+            reason = "permission" if isinstance(exc, PermissionError) else "unavailable"
+            result.skip(src.name, ".", reason, f"{exc}. {PERMISSION_HINT}")
+            continue
         start = root / prefix
         # Reject symlinks in each --only component before traversing them.
         cursor = root
+        excluded_prefix = False
         for part in prefix.parts:
             cursor = cursor / part
             if cursor.is_symlink():
                 raise ValueError("--only must not traverse a symlink")
+            relative = cursor.relative_to(root).as_posix()
+            if part.lower() in EXCLUDED_DIRS or any(
+                fnmatch.fnmatch(relative, p)
+                or fnmatch.fnmatch(part, p)
+                or PurePosixPath(relative).match(p)
+                for p in config.exclude_patterns
+            ):
+                result.skip(src.name, relative, "excluded_directory")
+                excluded_prefix = True
+                break
+            try:
+                info = cursor.stat(follow_symlinks=False)
+                if config.skip_cloud_only and getattr(info, "st_flags", 0) & SF_DATALESS:
+                    result.skip(src.name, relative, "cloud_only")
+                    excluded_prefix = True
+                    break
+            except OSError as exc:
+                reason = "permission" if isinstance(exc, PermissionError) else "unavailable"
+                result.skip(src.name, relative, reason, f"{exc}. {PERMISSION_HINT}")
+                excluded_prefix = True
+                break
+        if excluded_prefix:
+            continue
         pending = [start]
         while pending:
             directory = pending.pop()
             try:
+                info = directory.stat(follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode):
+                    result.skip(src.name, str(directory.relative_to(root)), "symlink")
+                    continue
+                if config.skip_cloud_only and getattr(info, "st_flags", 0) & SF_DATALESS:
+                    result.skip(src.name, str(directory.relative_to(root)), "cloud_only")
+                    continue
                 with os.scandir(directory) as entries:
                     ordered = sorted(entries, key=lambda entry: entry.name)
             except (PermissionError, OSError) as exc:

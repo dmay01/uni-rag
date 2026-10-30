@@ -33,6 +33,7 @@ class Config:
     chat_model: str = "qwen3:14b"
     chat_models: tuple[str, ...] = ("qwen3:4b", "qwen3:14b", "qwen3:30b-a3b")
     timeout_seconds: float = 180
+    context_window: int = 8192
     top_k: int = 8
     candidate_k: int = 32
     rrf_constant: int = 60
@@ -62,6 +63,8 @@ class Config:
                 raise ValueError(f"{name} must be positive")
         if self.max_file_mb <= 0 or self.timeout_seconds <= 0 or self.min_slide_tokens < 0:
             raise ValueError("Invalid size, timeout or minimum slide size")
+        if self.context_window < 1024:
+            raise ValueError("context_window must be at least 1024 tokens")
         if self.sample_interval_ms < 1 or self.baseline_seconds < 0:
             raise ValueError("Invalid energy sampling settings")
         if self.energy_backend not in {"auto", "macmon", "powermetrics", "none"}:

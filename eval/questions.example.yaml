@@ -1,0 +1,22 @@
+# These questions refer only to tests/fixtures; use with tests/fixtures.config.toml.
+questions:
+  - id: hybrid
+    question: "What does hybrid retrieval combine?"
+    expected_sources: ["notes.md"]
+    reference_answer: "Dense vectors and BM25 keywords."
+  - id: fusion
+    question: "What does reciprocal rank fusion use?"
+    expected_sources: ["lecture.pdf"]
+    reference_answer: "Rank positions."
+  - id: multilingual
+    question: "Which embedding model supports multilingual retrieval, according to the speaker notes?"
+    expected_sources: ["slides.pptx"]
+    reference_answer: "bge-m3."
+  - id: languages
+    question: "Welche Sprachen sind für Laborberichte erlaubt?"
+    expected_sources: ["policy.docx"]
+    reference_answer: "Deutsch oder Englisch."
+  - id: missing
+    question: "What is the password for the university Wi-Fi network?"
+    expected_sources: []
+    out_of_scope: true

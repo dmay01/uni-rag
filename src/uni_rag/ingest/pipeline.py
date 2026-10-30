@@ -120,6 +120,10 @@ def ingest(
                         with item.path.open("rb") as handle:
                             digest = hashlib.file_digest(handle, "sha1").hexdigest()
                         if manifest.complete(digest):
+                            final = item.path.stat(follow_symlinks=False)
+                            if (final.st_size, final.st_mtime_ns) != (item.size, item.mtime_ns):
+                                scan.skip(item.source, item.relative_path, "changed_during_ingest")
+                                continue
                             count = manifest.chunk_count(digest)
                             manifest.mark(item, digest, count)
                             summary["duplicate_files"] += 1
@@ -137,11 +141,18 @@ def ingest(
                             continue
                         chunks = chunk(units, item, digest, config)
                         pending = [c for c in chunks if c.id not in existing]
-                        for offset in range(0, len(pending), config.embedding_batch_size):
-                            batch = pending[offset : offset + config.embedding_batch_size]
-                            store.upsert(batch, client.embed([c.text for c in batch]))
-                            existing.update(c.id for c in batch)
-                            summary["embedding_chunks_written"] += len(batch)
+                        embedding_task = progress.add_task(
+                            "Embedding chunks", total=len(pending), visible=bool(pending)
+                        )
+                        try:
+                            for offset in range(0, len(pending), config.embedding_batch_size):
+                                batch = pending[offset : offset + config.embedding_batch_size]
+                                store.upsert(batch, client.embed([c.text for c in batch]))
+                                existing.update(c.id for c in batch)
+                                summary["embedding_chunks_written"] += len(batch)
+                                progress.advance(embedding_task, len(batch))
+                        finally:
+                            progress.remove_task(embedding_task)
                         final = item.path.stat(follow_symlinks=False)
                         if (final.st_size, final.st_mtime_ns) != (item.size, item.mtime_ns):
                             scan.skip(item.source, item.relative_path, "changed_during_ingest")

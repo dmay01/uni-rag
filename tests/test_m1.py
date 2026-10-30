@@ -20,6 +20,7 @@ def transport(request: httpx.Request) -> httpx.Response:
     if request.url.path == "/api/embed":
         return httpx.Response(200, json={"embeddings": [[1.0, 0.5, 0.1] for _ in payload["input"]]})
     assert payload["think"] is False
+    assert payload["options"]["num_ctx"] == 8192
     assert "Hybrid retrieval" in payload["messages"][1]["content"]
     return httpx.Response(
         200,
@@ -136,3 +137,51 @@ def test_config_rejects_remote_ollama_and_data_escape(tmp_path):
         Config(sources, base_url="https://example.com")
     with pytest.raises(ValueError, match="inside the project"):
         Config(sources, data_dir=Path("/outside"))
+
+
+def test_only_cannot_bypass_directory_exclusions(cfg):
+    directory = cfg.sources[0].path / ".obsidian"
+    directory.mkdir()
+    (directory / "hidden.md").write_text("Never index this.")
+    result = walk(cfg, only=".obsidian")
+    assert result.files == []
+    assert result.skip_counts == {"excluded_directory": 1}
+
+
+def test_cloud_only_root_is_never_listed(cfg, monkeypatch):
+    import uni_rag.ingest.walker as walker
+
+    original_stat = Path.stat
+
+    def cloud_stat(path, *args, **kwargs):
+        if path == cfg.sources[0].path:
+            return SimpleNamespace(st_mode=0o40755, st_flags=SF_DATALESS)
+        return original_stat(path, *args, **kwargs)
+
+    def forbidden(path):
+        raise AssertionError("A cloud-only directory was listed")
+
+    monkeypatch.setattr(Path, "stat", cloud_stat)
+    monkeypatch.setattr(walker.os, "scandir", forbidden)
+    result = walk(cfg, only="nested/deep")
+    assert result.files == []
+    assert result.skip_counts == {"cloud_only": 1}
+
+
+def test_permission_hint_and_size_patterns(cfg, monkeypatch):
+    from dataclasses import replace
+
+    import uni_rag.ingest.walker as walker
+
+    tiny = replace(cfg, max_file_mb=0.001, exclude_patterns=("*.tex",))
+    result = walk(tiny)
+    assert result.skip_counts["too_large"] >= 2
+    assert result.skip_counts["excluded_pattern"] == 1
+
+    def denied(path):
+        raise PermissionError("Synthetic access denial")
+
+    monkeypatch.setattr(walker.os, "scandir", denied)
+    result = walk(cfg)
+    assert result.skip_counts == {"permission": 1}
+    assert "Files and Folders" in result.skipped[0]["detail"]

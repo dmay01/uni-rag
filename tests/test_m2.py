@@ -121,6 +121,8 @@ def test_configuration_change_requires_fresh_index(cfg):
         ingest(cfg, ollama=client)
         with pytest.raises(ValueError, match="settings changed"):
             ingest(replace(cfg, embedding_model="different"), ollama=client)
+        with pytest.raises(ValueError, match="differs from the index"):
+            retrieve("question", replace(cfg, embedding_model="different"), client)
 
 
 def test_logs_and_manifest_are_local(cfg):

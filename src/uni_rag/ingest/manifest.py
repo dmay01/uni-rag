@@ -98,6 +98,23 @@ def active_files(directory: Path) -> list[dict]:
     path = directory / "manifest.sqlite3"
     if not path.exists():
         return []
-    with sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True) as db:
+    with sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True) as db:
         db.row_factory = sqlite3.Row
         return [dict(row) for row in db.execute("SELECT * FROM files ORDER BY source, path")]
+
+
+def validate_index(config: Config) -> None:
+    path = config.data_dir / "manifest.sqlite3"
+    if not path.exists():
+        return
+    with sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True) as db:
+        settings = dict(db.execute("SELECT key, value FROM settings"))
+    signature = json.loads(settings.get("signature", "{}"))
+    if signature.get("embedding_model") != config.embedding_model:
+        raise ValueError("Embedding model differs from the index. Use a fresh storage.data_dir.")
+    for source in config.sources:
+        root = settings.get(f"root:{source.name}")
+        if root is not None and root != str(source.path.resolve()):
+            raise ValueError(
+                f"Root for {source.name} differs from the index. Use a fresh data_dir."
+            )

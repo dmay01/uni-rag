@@ -136,3 +136,23 @@ def test_ask_never_measures_idle_baseline(cfg, monkeypatch):
     with Ollama(cfg, httpx.MockTransport(transport)) as client:
         ingest(cfg, ollama=client)
         ask("What is hybrid retrieval?", cfg, client)
+
+
+def test_think_forwarding_and_visible_ttft(cfg):
+    def thinking(request):
+        if request.url.path != "/api/chat":
+            return transport(request)
+        assert json.loads(request.content)["think"] is True
+        return httpx.Response(
+            200,
+            text='{"message":{"thinking":"internal"}}\n'
+            '{"message":{"content":"Dense vectors and BM25 [1]."}}\n'
+            '{"done":true,"prompt_eval_count":80,"eval_count":12}\n',
+        )
+
+    with Ollama(cfg, httpx.MockTransport(thinking)) as client:
+        ingest(cfg, ollama=client)
+        answer = ask("What is hybrid retrieval?", cfg, client, think=True)
+    assert answer.metrics["think"] is True
+    assert answer.metrics["first_model_token_seconds"] <= answer.metrics["ttft_seconds"]
+    assert "internal" not in answer.text

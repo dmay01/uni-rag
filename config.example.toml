@@ -25,6 +25,7 @@ embedding_model = "bge-m3"
 chat_model = "qwen3:14b"
 chat_models = ["qwen3:4b", "qwen3:14b", "qwen3:30b-a3b"]
 timeout_seconds = 180
+context_window = 8192
 
 [retrieval]
 top_k = 8
