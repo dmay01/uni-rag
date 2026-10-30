@@ -1,6 +1,7 @@
 """Local RAG CLI. Nothing executes on import."""
 
 import json
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
 
@@ -16,6 +17,13 @@ from uni_rag.ollama import Ollama
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
 console = Console()
 ConfigOption = Annotated[Path, typer.Option("--config", help="Path to a local TOML config")]
+
+
+class EnergyBackend(StrEnum):
+    auto = "auto"
+    macmon = "macmon"
+    powermetrics = "powermetrics"
+    none = "none"
 
 
 def configuration(path: Path) -> Config:
@@ -55,6 +63,7 @@ def ask(
     show_context: bool = False,
     file_type: str | None = None,
     path_prefix: str | None = None,
+    energy: Annotated[EnergyBackend | None, typer.Option()] = None,
 ) -> None:
     """Ask a question using local document context and Ollama."""
     cfg = configuration(config)
@@ -71,6 +80,7 @@ def ask(
                 file_type,
                 path_prefix,
                 on_token=lambda text: console.print(text, end="", markup=False),
+                energy=energy,
             )
         console.print()
         for line in source_lines(answer):
@@ -91,6 +101,7 @@ def chat(
     model: str | None = None,
     k: Annotated[int | None, typer.Option(min=1)] = None,
     think: Annotated[bool, typer.Option("--think/--no-think")] = False,
+    energy: Annotated[EnergyBackend | None, typer.Option()] = None,
 ) -> None:
     """Interactive, independently grounded questions. Type /exit or press Ctrl-D to leave."""
     console.print("Local chat. Ask self-contained questions; /exit to leave.")
@@ -103,4 +114,12 @@ def chat(
         if question in {"/exit", "/quit"}:
             return
         if question:
-            ask(question, config, source, model, k, think)
+            ask(question, config, source, model, k, think, energy=energy)
+
+
+@app.command()
+def stats(config: ConfigOption = PROJECT_ROOT / "config.toml") -> None:
+    """Inspect the local manifest/index/metrics without touching source folders."""
+    from uni_rag.stats import stats as index_stats
+
+    console.print_json(json.dumps(index_stats(configuration(config))))

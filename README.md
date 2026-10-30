@@ -134,3 +134,42 @@ uv run rag chat --source obsidian --no-think
 
 Chat is an interactive sequence of independently grounded, self-contained questions.
 Answers list the sources actually cited; out-of-range model citations are marked invalid.
+
+## Measurements and power
+
+```sh
+uv run rag stats
+uv run rag ask "What is MRR?" --energy auto --no-think
+```
+
+Every attempted query writes a JSONL record to `data/metrics/`: model, think setting,
+question ID, query ID, k, retrieval time, visible-answer TTFT, total query time, prompt and
+completion tokens, and decode tokens/s from Ollama's `eval_count/eval_duration`. Total time
+covers retrieval through the final streamed event. The first model token is recorded
+separately from visible TTFT when thinking is enabled. No token counts are inferred when
+Ollama does not provide them. Metrics contain no question or document text.
+
+Set `[energy] energy_backend = "auto"` in config, or override it with
+`--energy auto|macmon|powermetrics|none`. Auto starts macmon's JSON `pipe` mode, then tries an
+existing powermetrics log, then records null. Macmon is optional (`brew install macmon`).
+The app never invokes sudo. To sample externally in another terminal, from this project:
+
+```sh
+mkdir -p data
+sudo powermetrics --samplers cpu_power,gpu_power -i 200 -o data/power.log
+```
+
+Power measurements sum CPU, GPU and ANE, in watts; this is not whole-system/battery energy.
+All three components must be present. Readings integrate by the trapezoidal rule, with
+interpolation only between adjacent measured points covering the entire query window.
+Missing endpoints, gaps, stale logs and sampler failures produce null, with a warning;
+no power is extrapolated. Powermetrics headers can have one-second timestamp precision:
+readings sharing a timestamp are averaged, and the observed interval is recorded separately
+from the requested 200 ms interval. Use macmon for finer timestamp alignment.
+
+Every metric includes the requested/used backend and configured/observed sampling interval.
+Sampler startup and waiting for the trailing power reading are excluded from query latency.
+Only eval measures idle baseline, after warm-up. Gross energy and energy above that baseline
+are stored separately; baseline values are never reused across different backends.
+Above-idle energy can be negative due to ordinary baseline variation and is not clamped.
+Ask/chat record null above-idle energy because they do not measure an idle baseline.
