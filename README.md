@@ -107,3 +107,30 @@ uv run pytest
 
 Tests use mock Ollama responses and synthetic documents. All test scratch files stay in
 the project cache. The dependency resolution is pinned in `uv.lock`.
+
+## Incremental indexing and retrieval
+
+The SQLite manifest records source, relative path, byte size, nanosecond mtime and SHA1.
+Unchanged size/mtime skips content reads. Changed files are hashed; exact duplicate bytes
+share one set of vectors and retain every source path. Each completed embedding batch is
+durable. A file becomes searchable only when all its chunks are committed in the manifest.
+Rerunning the same command reuses completed batches after interruption or sleep.
+
+Deleted and newly excluded files are removed after a successful scan of the selected scope.
+`--limit` never deletes files. Permission failures and cloud-only subtrees preserve existing
+manifest entries. Parse failures retain the previous successful version and are logged.
+Changing embedding/chunk settings or a named source root requires a fresh `storage.data_dir`.
+Run only one ingest at a time.
+
+Hybrid retrieval uses cosine top-k and BM25 top-k, with RRF score `sum(1/(60 + rank))` by
+default. Filters apply before either ranking, including aliases of duplicate files. BM25
+uses Unicode word tokenization with no stopword list, stemming or language downloads.
+The keyword cache is rebuilt from active chunks when the manifest revision changes.
+Vector scans are exact; metadata loading and BM25 rebuilding scale with corpus size.
+
+```sh
+uv run rag chat --source obsidian --no-think
+```
+
+Chat is an interactive sequence of independently grounded, self-contained questions.
+Answers list the sources actually cited; out-of-range model citations are marked invalid.

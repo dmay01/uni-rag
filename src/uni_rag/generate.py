@@ -1,5 +1,6 @@
 """Grounded streaming answers. Retrieved text is data, never system instructions."""
 
+import re
 import time
 from collections.abc import Callable
 
@@ -19,6 +20,21 @@ def context_text(hits: list[Hit]) -> str:
     return "\n\n".join(
         f"[{i}] {hit.chunk.locations[0].label()}\n{hit.chunk.text}" for i, hit in enumerate(hits, 1)
     )
+
+
+def cited_numbers(text: str) -> set[int]:
+    return {int(match) for match in re.findall(r"\[(\d+)\]", text)}
+
+
+def source_lines(answer: Answer) -> list[str]:
+    lines = []
+    for number in sorted(cited_numbers(answer.text)):
+        if 1 <= number <= len(answer.hits):
+            locations = answer.hits[number - 1].chunk.locations
+            lines.append(f"[{number}] " + "; ".join(loc.label() for loc in locations))
+        else:
+            lines.append(f"[{number}] INVALID: model cited an unknown source")
+    return lines
 
 
 def ask(
@@ -56,6 +72,8 @@ def ask(
                 on_token(content)
         if event.get("done"):
             done = event
+    if not done:
+        raise RuntimeError("Ollama stream ended without a final done event")
     end = time.perf_counter()
     return Answer(
         "".join(parts),

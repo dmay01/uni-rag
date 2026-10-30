@@ -9,6 +9,7 @@ from rich.console import Console
 
 from uni_rag.config import PROJECT_ROOT, Config, load_config
 from uni_rag.generate import ask as generate_answer
+from uni_rag.generate import source_lines
 from uni_rag.ingest.pipeline import ingest as run_ingest
 from uni_rag.ollama import Ollama
 
@@ -72,8 +73,8 @@ def ask(
                 on_token=lambda text: console.print(text, end="", markup=False),
             )
         console.print()
-        for number, hit in enumerate(answer.hits, 1):
-            console.print(f"[{number}] {hit.chunk.locations[0].label()}", markup=False)
+        for line in source_lines(answer):
+            console.print(line, markup=False)
         if show_context:
             from uni_rag.generate import context_text
 
@@ -81,3 +82,25 @@ def ask(
     except Exception as exc:
         console.print(f"Query failed: {exc}", markup=False)
         raise typer.Exit(1) from exc
+
+
+@app.command()
+def chat(
+    config: ConfigOption = PROJECT_ROOT / "config.toml",
+    source: str | None = None,
+    model: str | None = None,
+    k: Annotated[int | None, typer.Option(min=1)] = None,
+    think: Annotated[bool, typer.Option("--think/--no-think")] = False,
+) -> None:
+    """Interactive, independently grounded questions. Type /exit or press Ctrl-D to leave."""
+    console.print("Local chat. Ask self-contained questions; /exit to leave.")
+    while True:
+        try:
+            question = console.input("You> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            return
+        if question in {"/exit", "/quit"}:
+            return
+        if question:
+            ask(question, config, source, model, k, think)
