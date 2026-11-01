@@ -1,5 +1,6 @@
 config.toml
 eval/questions.yaml
+eval/*.local.yaml
 data/
 .venv/
 .cache/
