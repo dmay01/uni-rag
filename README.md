@@ -95,14 +95,134 @@ Development and tests use only original synthetic fixtures. They never load `con
 - Approximate chunk token counts may need tuning for formulas, code and very large slides.
 - Grounding is prompted, not guaranteed: inspect citations and retrieved context.
 
-## Results
+## Results (v0.1)
 
-Benchmark results stay local. `rag report` writes a filled table under `data/reports/`
-for manual inclusion here; the repository table stays empty.
+Measured on a MacBook Pro (Apple M5, 32 GB unified memory) with Ollama, fully offline.
+Corpus: my own university documents (Obsidian notes and TU Wien course and research material),
+4,297 files and 266,057 chunks, embedded with bge-m3. Hybrid retrieval (LanceDB vectors + BM25,
+reciprocal rank fusion), k = 8, context window 8,192 tokens.
 
-| Model | Think | Queries | Median latency (s) | Median TTFT (s) | Tokens/s | Gross J/answer | Above-idle J/answer | Hit@k |
-|---|---|---|---|---|---|---|---|---|
-| — | — | — | — | — | — | — | — | — |
+Evaluation set: 60 questions generated with an LLM from the corpus; 45 are answerable and
+15 are deliberately out of scope. Questions and answers stay private; only aggregates are published.
+
+Protocol: each question is retrieved once and all models answer from the same retrieved chunks.
+Models are warmed up before timed questions and unloaded between model runs. The thinking run
+was resumed once, with an additional warm-up and idle baseline for the resumed 4B segment.
+Latency and energy cover generation only; retrieval is timed separately (median
+1.117 s per question). Warm-up and sampler startup are excluded;
+any residual per-request model loading is included. Tables show medians over 60 generation
+attempts per model, except visible-answer TTFT when no answer was produced.
+Runs: main `20261104T075907Z-4117b883`, thinking `20261104T083232Z-89bb4162`.
+
+### Retrieval (45 answerable questions)
+
+| Metric | Strict | Lenient |
+|---|---|---|
+| Hit@8 | 0.444 (20/45) | 0.489 (22/45) |
+| MRR | 0.282 | 0.326 |
+
+Strict: an expected source matches a top-8 chunk, including page/slide when annotated.
+Lenient: also accepts a different copy (same normalised filename stem, or document-level
+five-word-shingle Dice similarity ≥ 0.95). A wrong page in the same file does not count as a copy.
+
+### Generation (thinking off, max 512 output tokens, ~150-word answers)
+
+| Model | Architecture | Latency (s) | TTFT (s) | Decode tokens/s | Energy (J/answer) | Cites expected source | Admits missing (out of scope) |
+|---|---|---|---|---|---|---|---|
+| qwen3:4b-q4_K_M | dense, 4B | 6.2 | 4.0 | 34.5 | 117 | 14/45 | 15/15 |
+| qwen3:14b | dense, 14B | 17.6 | 12.1 | 11.6 | 362 | 18/45 | 7/15 |
+| qwen3:30b-a3b-q4_K_M | MoE, 30B total / 3B active | 6.5 | 4.8 | 40.5 | 185 | 18/45 | 13/15 |
+
+Decode tokens/s is Ollama's completion-token count divided by its evaluation duration in
+seconds (`eval_count / (eval_duration / 1e9)`), rather than tokens divided by wall-clock latency.
+TTFT is time to the first visible answer token, including prompt processing and any residual load.
+
+Energy is gross energy per answer, measured with macmon (CPU+GPU+ANE) over the generation
+window, not whole-system or battery energy. Energy was recorded for 180/180 answers.
+
+### Thinking variants (separate run, max 4,096 output tokens)
+
+| Model | Reasoning tokens | Answer tokens | Latency (s) | Visible-answer TTFT (s) | Energy (J/answer) | Cites expected source |
+|---|---|---|---|---|---|---|
+| qwen3:4b-thinking-2507-q4_K_M | 966.5 | 94 | 33.7 | 29.0 | 643 | 18/45 |
+| qwen3:30b-a3b-thinking-2507-q4_K_M | 525.5 | 105.5 | 21.5 | 18.8 | 524 | 18/45 |
+
+These are the Qwen3 Thinking-2507 weights, a later release than the hybrid models above.
+The comparison is therefore between two deployment options at the same model size, not
+thinking on/off with identical weights. Visible-answer TTFT includes hidden reasoning;
+it is not the time to the first reasoning token.
+
+One 4B generation used the full 4,096-token budget without a visible answer. It is included
+in token, latency, energy and citation aggregates; its visible-answer TTFT is missing, so
+that median uses 59 responses. Energy was recorded for 120/120 generations. A repetition
+heuristic flagged hidden reasoning in 18/60 (4B) and
+7/60 (30B) generations; visible answers had no repetition flags.
+Reasoning and answer token counts come from stream logprobs; delimiter/control tokens are
+recorded separately, so the displayed component medians need not sum to a total-token median.
+
+### Findings
+
+1. **Retrieval coverage is a major limitation.** The expected source matches the top 8 for
+   fewer than half of the answerable questions. Of the 25 strict misses, only 2 were copies
+   or versions of the expected file; a lexical heuristic classified 21 as "different document
+   on the right topic" and 2 as unrelated (both categories need manual review). When an
+   expected source was retrieved, 14B and 30B cited it in 18 of 20 cases and
+   4B in 14 of 20. This measures attribution, not answer correctness.
+2. **The MoE model offered a better latency/energy trade-off than dense 14B.**
+   qwen3:30b-a3b-q4_K_M answered 2.7× faster than qwen3:14b
+   (6.5 vs 17.6 s) with about half the energy per answer
+   (185 vs 362 J) and the same expected-source citation rate.
+   With about 3B active parameters per token, it also decoded faster than dense 4B.
+   The model-size trade-off is 18 GB vs 9.3 GB for 14B, as reported by `ollama list`.
+   These are stored model sizes, not measured resident memory; actual memory also depends
+   on runtime buffers and the context cache.
+3. **Most latency came before the first visible answer.** TTFT was 65–73% of median latency
+   (ratios of medians). Recorded per-request load times were small relative to TTFT,
+   consistent with models remaining loaded after warm-up. Each model received a median of
+   3,520 prompt tokens, while median visible answers were only about 55–85 tokens.
+   The saved metrics omit `prompt_eval_duration`, so exact prompt-evaluation rates and the
+   share attributable solely to prompt processing cannot be recovered. Reducing context
+   is an optimisation to test, rather than a measured latency/energy improvement here.
+4. **The 4B model was cheapest but cited the expected source least often.** It used
+   37% less energy per answer than MoE at similar latency
+   but cited the expected source less often (14 vs 18 of 45).
+   It admitted missing information for all 15 out-of-scope questions. The same heuristic
+   also triggered on 6/45 answerable questions for 4B,
+   3/45 for 14B and 4/45 for 30B.
+   No admission was detected among the 20 strict retrieval hits for any model.
+   These flags alone do not establish false refusals:
+   a corpus-level answerable question may still have insufficient retrieved evidence,
+   and the admission heuristic can miss or misclassify phrasing.
+5. **Thinking was expensive and did not improve 30B citations.** Relative to the main runs,
+   energy rose 2.8× for 30B (185 → 524 J) and 5.5× for 4B (117 → 643 J);
+   latency rose 3.3× and 5.4× respectively. The 30B citation count stayed at 18/45,
+   while 4B rose from 14/45 to 18/45. Small-model thinking was the most expensive measured
+   configuration and produced about 1.8× as many reasoning tokens as 30B;
+   this is not a causal isolation of reasoning cost.
+
+### Limitations
+
+- One machine, one run per configuration (one thinking run resumed), medians without
+  confidence intervals. With 45 answerable questions, one question is 2.2 percentage points.
+- The questions were generated by an LLM from the corpus. Forty answerable questions have
+  one expected source; five have two. The current retrieval and citation checks accept
+  any expected source, so they do not verify that both sources support a multi-document answer.
+  Similar content can occur in multiple documents; strict Hit@8 may underestimate useful
+  retrieval. Filename-based lenient matching can also count unrelated namesakes.
+- "Cites expected source" and "admits missing" are lexical checks, not judgments of answer
+  correctness. These benchmark runs use no LLM-as-judge.
+- Idle baselines differed strongly between main model runs (about 2.7 to 22 W), so energy
+  above idle is not compared; all published energy figures are gross CPU+GPU+ANE energy.
+- Latency and energy exclude retrieval, explicit warm-up and sampler startup; they include
+  any per-request model load. Exact prompt-evaluation durations were not recorded.
+- The thinking results use different weight releases than the main run (see above).
+
+### Next: v0.2
+
+Improve retrieval and measure the effect on the same questions: a per-document cap in the
+top 8, reranking of the top 50 hybrid results with a local cross-encoder, and an ablation
+of vector-only vs BM25-only vs hybrid. Report Hit@8, citation rate, TTFT and J/answer before
+and after, including the reranker's own time and energy.
 
 ## Development
 
