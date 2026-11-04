@@ -23,9 +23,12 @@ min_slide_tokens = 30
 base_url = "http://localhost:11434"
 embedding_model = "bge-m3"
 chat_model = "qwen3:14b"
-chat_models = ["qwen3:4b", "qwen3:14b", "qwen3:30b-a3b"]
+# Explicit original hybrid tags; short 4b/30b aliases may point to thinking-only releases.
+chat_models = ["qwen3:4b-q4_K_M", "qwen3:14b", "qwen3:30b-a3b-q4_K_M"]
 timeout_seconds = 180
 context_window = 8192
+num_predict = 512
+answer_max_words = 150
 
 [retrieval]
 top_k = 8
@@ -40,3 +43,5 @@ energy_backend = "auto" # auto/macmon/powermetrics/none
 power_log = "./data/power.log"
 baseline_seconds = 3
 sample_interval_ms = 200
+max_sample_gap_ms = 1000 # Interpolate only between measured points within this bound.
+sample_wait_seconds = 6 # Bounded wait for a trailing sample under load.

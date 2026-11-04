@@ -1,5 +1,6 @@
 """Measured CPU+GPU+ANE energy. No extrapolation, sudo, or invented missing readings."""
 
+import bisect
 import json
 import logging
 import math
@@ -9,6 +10,7 @@ import statistics
 import subprocess
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -108,8 +110,35 @@ def integrate(
     return energy, statistics.median(intervals) if intervals else None
 
 
+def coverage(samples: list[Sample], start: float, end: float, max_gap: float) -> dict:
+    ordered = sorted(samples, key=lambda sample: sample.timestamp)
+    relevant = [sample for sample in ordered if start <= sample.timestamp <= end]
+    before = [sample for sample in ordered if sample.timestamp <= start]
+    after = [sample for sample in ordered if sample.timestamp >= end]
+    window = ([before[-1]] if before else []) + relevant + ([after[0]] if after else [])
+    times = sorted({sample.timestamp for sample in window})
+    gaps = [b - a for a, b in zip(times, times[1:], strict=False)]
+    reason = (
+        "missing_start"
+        if not before
+        else "missing_end"
+        if not after
+        else "sample_gap"
+        if gaps and max(gaps) > max_gap
+        else None
+    )
+    return {
+        "reason": reason,
+        "max_allowed_gap_ms": max_gap * 1000,
+        "sample_count": len(times),
+        "first_timestamp": times[0] if times else None,
+        "last_timestamp": times[-1] if times else None,
+        "max_gap_ms": max(gaps) * 1000 if gaps else None,
+    }
+
+
 class PowerSampler:
-    """One live sampler per benchmark; ask/chat never measure an idle baseline."""
+    """One sampler per model. Preserve complete windows even if the process later exits."""
 
     def __init__(self, config: Config, backend: str | None = None):
         self.config = config
@@ -118,105 +147,183 @@ class PowerSampler:
             raise ValueError("energy must be auto/macmon/powermetrics/none")
         self.process: subprocess.Popen | None = None
         self.thread: threading.Thread | None = None
+        self.stderr_thread: threading.Thread | None = None
         self.samples: deque[Sample] = deque(maxlen=100_000)
+        self.condition = threading.Condition()
         self.failed = False
+        self.closing = False
         self.warnings: list[str] = []
+        self.stderr: deque[str] = deque(maxlen=8)
         self.baselines: dict[str, float] = {}
+        self.restarts = 0
+        self.sample_log = config.data_dir / "logs" / f"macmon-{uuid.uuid4().hex[:12]}.jsonl"
         if self.requested in {"auto", "macmon"}:
             self._start_macmon()
 
     def warn(self, message: str) -> None:
-        if message not in self.warnings:
-            logger.warning(message)
+        logger.warning(message)
+        with self.condition:
             self.warnings.append(message)
-            directory = self.config.data_dir / "logs"
-            directory.mkdir(parents=True, exist_ok=True)
-            with (directory / "warnings.jsonl").open("a") as handle:
-                handle.write(json.dumps({"timestamp": time.time(), "warning": message}) + "\n")
+        directory = self.config.data_dir / "logs"
+        directory.mkdir(parents=True, exist_ok=True)
+        with (directory / "warnings.jsonl").open("a") as handle:
+            handle.write(json.dumps({"timestamp": time.time(), "warning": message}) + "\n")
 
     def _start_macmon(self) -> None:
         executable = shutil.which("macmon")
         if not executable:
-            self.warn("macmon is unavailable; trying an existing power log if configured")
+            self.failed = True
+            self.warn("macmon unavailable; auto may use an existing current power log")
             return
         try:
-            help_result = subprocess.run(
+            result = subprocess.run(
                 [executable, "pipe", "--help"],
                 capture_output=True,
                 text=True,
                 timeout=3,
                 check=True,
             )
-            if "--interval" not in help_result.stdout:
-                raise ValueError("macmon pipe JSON mode is unsupported")
+            if "--interval" not in result.stdout:
+                raise ValueError("macmon JSON pipe mode unsupported")
+            self.failed = False
             self.process = subprocess.Popen(
                 [executable, "pipe", "-i", str(self.config.sample_interval_ms)],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
+                bufsize=1,
             )
-            self.thread = threading.Thread(target=self._read, daemon=True)
+            process = self.process
+            self.thread = threading.Thread(target=self._read, args=(process,), daemon=True)
+            self.stderr_thread = threading.Thread(
+                target=self._read_stderr, args=(process,), daemon=True
+            )
             self.thread.start()
-            deadline = time.monotonic() + max(1.5, self.config.sample_interval_ms / 500)
-            while not self.samples and not self.failed and time.monotonic() < deadline:
-                time.sleep(0.01)
+            self.stderr_thread.start()
+            deadline = time.monotonic() + self.config.sample_wait_seconds
+            with self.condition:
+                while not self.samples and not self.failed:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self.condition.wait(remaining)
             if not self.samples:
                 self.failed = True
-                self.warn("macmon produced no usable samples; energy may be unavailable")
+                self.warn("macmon produced no usable samples before startup timeout")
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             self.failed = True
-            self.warn(f"macmon failed: {exc}; continuing without live power readings")
+            self.warn(f"macmon startup failed: {exc}")
 
-    def _read(self) -> None:
+    def _read_stderr(self, process: subprocess.Popen) -> None:
+        for line in process.stderr:
+            self.stderr.append(line.strip())
+
+    def _read(self, process: subprocess.Popen) -> None:
         try:
-            for line in self.process.stdout:
-                self.samples.append(macmon_sample(json.loads(line)))
-        except (ValueError, KeyError, TypeError, OSError) as exc:
-            self.failed = True
-            self.warn(f"macmon sampling failed: {exc}; query will continue")
+            self.sample_log.parent.mkdir(parents=True, exist_ok=True)
+            with self.sample_log.open("a", buffering=1) as log:
+                for line in process.stdout:
+                    try:
+                        sample = macmon_sample(json.loads(line))
+                    except (ValueError, KeyError, TypeError) as exc:
+                        self.warn(f"Discarded invalid macmon record: {exc}")
+                        continue
+                    log.write(
+                        json.dumps(
+                            {
+                                "timestamp": sample.timestamp,
+                                "watts": sample.watts,
+                                "received_at": time.time(),
+                            }
+                        )
+                        + "\n"
+                    )
+                    with self.condition:
+                        self.samples.append(sample)
+                        self.condition.notify_all()
+        except OSError as exc:
+            if not self.closing:
+                self.warn(f"macmon read failed: {exc}")
         finally:
-            if self.process and self.process.poll() is not None:
+            with self.condition:
                 self.failed = True
+                self.condition.notify_all()
+            if not self.closing:
+                self.warn(
+                    f"macmon exited/closed stdout; return code={process.poll()}, "
+                    f"stderr={list(self.stderr)}"
+                )
+
+    def prepare(self) -> None:
+        """Recover between queries, never extrapolate over the failed query's gap."""
+        if self.requested not in {"auto", "macmon"}:
+            return
+        stale = not self.samples or time.time() - self.samples[-1].timestamp > (
+            self.config.sample_wait_seconds
+        )
+        if self.failed or stale:
+            self._stop()
+            with self.condition:
+                self.samples.clear()
+            self.restarts += 1
+            self.closing = False
+            self._start_macmon()
+
+    def _window(self, start: float, end: float) -> list[Sample]:
+        with self.condition:
+            readings = list(self.samples)
+        times = [sample.timestamp for sample in readings]
+        lo = max(0, bisect.bisect_right(times, start) - 1)
+        hi = bisect.bisect_left(times, end) + 1
+        return readings[lo:hi]
 
     def measure(self, start: float, end: float) -> dict:
         result = {
             "energy_backend": "none",
             "energy_requested_backend": self.requested,
             "energy_sample_interval_ms": self.config.sample_interval_ms,
+            "energy_max_allowed_gap_ms": self.config.max_sample_gap_ms,
             "energy_observed_interval_ms": None,
             "energy_gross_joules": None,
             "energy_above_baseline_joules": None,
             "energy_baseline_watts": None,
             "energy_domain": "CPU+GPU+ANE",
             "energy_warnings": [],
+            "energy_restarts": self.restarts,
+            "energy_sample_log": str(self.sample_log) if self.process else None,
+            "energy_coverage": {},
         }
         if self.requested == "none":
             return result
-        deadline = time.monotonic() + max(1.3, 3 * self.config.sample_interval_ms / 1000)
+        deadline = time.monotonic() + self.config.sample_wait_seconds
+        warning_start = len(self.warnings)
         while True:
             choices = []
-            if self.requested in {"auto", "macmon"} and self.samples and not self.failed:
+            if self.requested in {"auto", "macmon"}:
                 choices.append(
-                    ("macmon", list(self.samples), 1.75 * self.config.sample_interval_ms / 1000)
+                    ("macmon", self._window(start, end), self.config.max_sample_gap_ms / 1000)
                 )
             if self.requested in {"auto", "powermetrics"} and self.config.power_log.exists():
                 try:
-                    # Read repeatedly until the external writer has flushed the trailing sample.
                     choices.append(
                         (
                             "powermetrics",
                             powermetrics_samples(self.config.power_log),
-                            max(1.25, 1.75 * self.config.sample_interval_ms / 1000),
+                            max(1.25, self.config.max_sample_gap_ms / 1000),
                         )
                     )
                 except (OSError, ValueError) as exc:
                     self.warn(f"Cannot read powermetrics log: {exc}")
+            pending_endpoint = False
             for backend, readings, max_gap in choices:
+                detail = coverage(readings, start, end, max_gap)
+                result["energy_coverage"][backend] = detail
                 gross, observed = integrate(readings, start, end, max_gap)
                 if gross is not None:
                     baseline = self.baselines.get(backend)
                     result.update(
                         energy_backend=backend,
+                        energy_max_allowed_gap_ms=max_gap * 1000,
                         energy_gross_joules=gross,
                         energy_observed_interval_ms=observed,
                         energy_baseline_watts=baseline,
@@ -224,21 +331,31 @@ class PowerSampler:
                             gross - baseline * (end - start) if baseline is not None else None
                         ),
                     )
-                    result["energy_warnings"] = list(self.warnings)
+                    result["energy_warnings"] = self.warnings[warning_start:]
                     return result
-            if time.monotonic() >= deadline or (
-                not choices and not self.process and not self.config.power_log.exists()
-            ):
+                pending_endpoint |= detail["reason"] == "missing_end"
+            can_wait = (self.process is not None and not self.failed) or (
+                self.requested in {"auto", "powermetrics"} and self.config.power_log.exists()
+            )
+            if not pending_endpoint or not can_wait or time.monotonic() >= deadline:
                 break
-            time.sleep(0.02)
-        self.warn("No complete, current power coverage for the query window; energy is null")
-        result["energy_warnings"] = list(self.warnings)
+            with self.condition:
+                self.condition.wait(min(0.1, max(0, deadline - time.monotonic())))
+        detail = {
+            "query_start": start,
+            "query_end": end,
+            "coverage": result["energy_coverage"],
+            "stderr": list(self.stderr),
+            "process_exit": self.process.poll() if self.process else None,
+        }
+        self.warn("Incomplete power coverage; energy is null: " + json.dumps(detail))
+        result["energy_warnings"] = self.warnings[warning_start:]
         return result
 
     def measure_idle(self, seconds: float) -> dict:
-        """Explicitly invoked by eval only, after model warm-up."""
         if seconds <= 0 or self.requested == "none":
             return {}
+        self.prepare()
         start = time.time()
         time.sleep(seconds)
         end = time.time()
@@ -249,7 +366,8 @@ class PowerSampler:
             )
         return measurement
 
-    def close(self) -> None:
+    def _stop(self) -> None:
+        self.closing = True
         if self.process:
             if self.process.poll() is None:
                 self.process.terminate()
@@ -258,10 +376,16 @@ class PowerSampler:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=2)
-            if self.thread:
-                self.thread.join(timeout=1)
-            if self.process.stdout:
-                self.process.stdout.close()
+            for thread in (self.thread, self.stderr_thread):
+                if thread:
+                    thread.join(timeout=1)
+            for pipe in (self.process.stdout, self.process.stderr):
+                if pipe:
+                    pipe.close()
+            self.process = None
+
+    def close(self) -> None:
+        self._stop()
 
     def __enter__(self) -> "PowerSampler":
         return self

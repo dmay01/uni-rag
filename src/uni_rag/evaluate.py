@@ -1,8 +1,12 @@
 """Local, inspectable retrieval/answer evaluation with isolated model runs."""
 
+import fcntl
+import gc
+import hashlib
 import json
 import logging
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -13,11 +17,14 @@ from rich.progress import Progress, TimeRemainingColumn
 
 from uni_rag.config import Config
 from uni_rag.energy import PowerSampler
+from uni_rag.eval_sources import SourceMatcher, retrieval_scores, strict_match
 from uni_rag.generate import ask, cited_numbers, context_text
+from uni_rag.ingest.manifest import active_files
 from uni_rag.ingest.pipeline import write_json
-from uni_rag.models import Answer
+from uni_rag.models import Answer, Chunk, Hit
 from uni_rag.ollama import Ollama
-from uni_rag.stats import stats
+from uni_rag.retrieve import Retriever
+from uni_rag.store.vectors import VectorStore
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +92,7 @@ def admits_missing(text: str) -> bool:
 def checks(question: Question, answer: Answer) -> dict:
     relevant = [
         any(
-            expected.casefold() in loc.label().casefold()
+            strict_match(expected, loc.label())
             for expected in question.expected_sources
             for loc in hit.chunk.locations
         )
@@ -146,6 +153,54 @@ def local_judge(client: Ollama, model: str, question: Question, answer: str, con
     return {"method": "local_llm_as_judge", "model": model, **result}
 
 
+def reuse_retrieval(
+    config: Config, run_id: str, questions_hash: str, k: int
+) -> tuple[dict, list[dict]]:
+    """Freeze exactly the same excerpts for an explicitly linked second experiment."""
+    from uni_rag.report import read_rows, select_run
+
+    selected = select_run(config, run_id)
+    if selected is None:
+        raise ValueError("Retrieval run not found")
+    path, metadata = selected
+    required = {
+        "questions_sha256": questions_hash,
+        "k": k,
+        "embedding_model": config.embedding_model,
+        "context_window": config.context_window,
+    }
+    if any(metadata.get(key) != value for key, value in required.items()):
+        raise ValueError("Reused retrieval has incompatible questions or settings")
+    rows = read_rows(path.parent / "retrieval.jsonl")
+    identifiers = {identifier for row in rows for identifier in row["retrieved_chunk_ids"]}
+    if not rows or any(not re.fullmatch(r"[0-9a-f]{40}", i) for i in identifiers):
+        raise ValueError("Invalid or empty saved retrieval")
+    store = VectorStore(config.data_dir / "index")
+    records = (
+        (
+            store.table.search()
+            .where("id IN (" + ",".join(f"'{i}'" for i in identifiers) + ")")
+            .select(["id", "text", "metadata"])
+            .limit(None)
+            .to_list()
+        )
+        if identifiers
+        else []
+    )
+    chunks = {row["id"]: Chunk.from_row(row) for row in records}
+    if set(chunks) != identifiers:
+        raise ValueError("Saved retrieval chunks are no longer in the index")
+    cached = {}
+    for row in rows:
+        # Scores are not reused for ranking: the saved rank order is already frozen.
+        hits = [Hit(chunks[i], 0.0) for i in row["retrieved_chunk_ids"]]
+        labels = [[loc.label() for loc in hit.chunk.locations] for hit in hits]
+        if labels != row["retrieved_sources"]:
+            raise ValueError("Saved retrieval metadata changed; use a fresh retrieval run")
+        cached[row["question_id"]] = (hits, row["retrieval_seconds"])
+    return cached, rows
+
+
 def evaluate(
     config: Config,
     questions_path: Path,
@@ -155,6 +210,8 @@ def evaluate(
     energy: str | None = None,
     judge_model: str | None = None,
     client: Ollama | None = None,
+    retrieval_run_id: str | None = None,
+    resume_run_id: str | None = None,
 ) -> dict:
     questions = load_questions(questions_path)
     selected = models if models is not None else list(config.chat_models)
@@ -163,8 +220,17 @@ def evaluate(
     selected = list(dict.fromkeys(selected))
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:8]
     directory = config.data_dir / "eval" / run_id
-    directory.mkdir(parents=True)
-    corpus = stats(config)
+    if resume_run_id:
+        from uni_rag.report import select_run
+
+        saved = select_run(config, resume_run_id)
+        if saved is None:
+            raise ValueError("Resume run not found")
+        directory = saved[0].parent
+        run_id = directory.name
+    directory.mkdir(parents=True, exist_ok=bool(resume_run_id))
+    files = active_files(config.data_dir)
+    corpus = {"files": len(files), "chunks": VectorStore(config.data_dir / "index").count()}
     meta = {
         "run_id": run_id,
         "status": "running",
@@ -180,22 +246,139 @@ def evaluate(
         "corpus_chunks": corpus["chunks"],
         "embedding_model": config.embedding_model,
         "context_window": config.context_window,
+        "num_predict": config.num_predict,
+        "answer_max_words": config.answer_max_words,
+        "retrieval_mode": "shared_precomputed",
+        "retrieval_reused_from": retrieval_run_id,
+        "questions_sha256": hashlib.sha256(questions_path.read_bytes()).hexdigest(),
         "candidate_k": config.candidate_k,
         "rrf_constant": config.rrf_constant,
     }
-    write_json(directory / "run.json", meta)
     results = []
     judge_tasks = []
+    # Prevent two processes from appending answers to the same resumed experiment.
+    run_lock = (directory / ".eval.lock").open("a")
     try:
+        fcntl.flock(run_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        run_lock.close()
+        raise ValueError("This evaluation run is already active") from exc
+    prepared = False
+    try:
+        if resume_run_id:
+            from uni_rag.report import read_rows
+
+            saved_meta = json.loads((directory / "run.json").read_text())
+            required = (
+                "models",
+                "think",
+                "k",
+                "energy_requested_backend",
+                "sample_interval_ms",
+                "questions",
+                "judge_model",
+                "embedding_model",
+                "context_window",
+                "num_predict",
+                "answer_max_words",
+                "questions_sha256",
+                "candidate_k",
+                "rrf_constant",
+            )
+            if any(saved_meta.get(key) != meta[key] for key in required):
+                raise ValueError("Resume settings or questions differ from the saved run")
+            if judge_model:
+                raise ValueError("Resuming runs with a judge is not supported")
+            results = read_rows(directory / "results.jsonl")
+            keys = [(row["model"], row["question_id"]) for row in results]
+            planned = {(model, q.id) for model in selected for q in questions}
+            if len(set(keys)) != len(keys) or not set(keys) <= planned:
+                raise ValueError("Saved answers have duplicate or unexpected identities")
+            meta = saved_meta
+            meta["status"] = "running"
+            meta.setdefault("resumed_at", []).append(datetime.now(UTC).isoformat())
+        completed = {(row["model"], row["question_id"]) for row in results}
+        prepared = True
+        write_json(directory / "run.json", meta)
         with Ollama(config) as local:
             api = client or local
+            digests = {model: api.digest(model) for model in selected}
+            if resume_run_id and meta.get("model_digests") != digests:
+                raise ValueError("Model digests changed since the saved run")
+            meta["model_digests"] = digests
+            write_json(directory / "run.json", meta)
             # Unload only models selected for this benchmark, including any left by a prior run.
             for model in selected:
                 api.unload(model)
+            # Retrieve each question once, freeze identical context for all models, and
+            # report retrieval independently of generation latency and energy.
+            if retrieval_run_id or resume_run_id:
+                cached, retrieval_rows = reuse_retrieval(
+                    config,
+                    resume_run_id or retrieval_run_id,
+                    meta["questions_sha256"],
+                    k or config.top_k,
+                )
+                if set(cached) != {question.id for question in questions}:
+                    raise ValueError("Reused retrieval question IDs differ")
+            else:
+                retriever = Retriever(config, api)
+                cached = {}
+                retrieval_rows = []
+                for question in questions:
+                    started = time.perf_counter()
+                    hits = retriever.search(question.question, k)
+                    elapsed = time.perf_counter() - started
+                    cached[question.id] = (hits, elapsed)
+                    retrieval_rows.append(
+                        {
+                            "question_id": question.id,
+                            "question": question.question,
+                            "expected_sources": list(question.expected_sources),
+                            "reference_answer": question.reference_answer,
+                            "out_of_scope": question.out_of_scope,
+                            "retrieval_seconds": elapsed,
+                            "retrieved_chunk_ids": [hit.chunk.id for hit in hits],
+                            "retrieved_sources": [
+                                [loc.label() for loc in hit.chunk.locations] for hit in hits
+                            ],
+                        }
+                    )
+                del retriever
+                gc.collect()
+                matcher = SourceMatcher(
+                    config,
+                    [label for row in retrieval_rows for label in row["expected_sources"]],
+                    [
+                        label
+                        for row in retrieval_rows
+                        for group in row["retrieved_sources"]
+                        for label in group
+                    ],
+                )
+                for row in retrieval_rows:
+                    row.update(
+                        retrieval_scores(
+                            row["expected_sources"],
+                            row["retrieved_sources"],
+                            matcher,
+                            row["out_of_scope"],
+                        )
+                    )
+                del matcher
+            with (directory / "retrieval.jsonl").open("w", encoding="utf-8") as retrieval_output:
+                for row in retrieval_rows:
+                    retrieval_output.write(json.dumps(row, ensure_ascii=False) + "\n")
+            by_question = {row["question_id"]: row for row in retrieval_rows}
+            gc.collect()
             with (directory / "results.jsonl").open("a", encoding="utf-8") as output:
                 with Progress(*Progress.get_default_columns(), TimeRemainingColumn()) as progress:
                     task = progress.add_task("Benchmarking", total=len(selected) * len(questions))
+                    progress.update(task, completed=len(results))
                     for model in selected:
+                        pending = [q for q in questions if (model, q.id) not in completed]
+                        if not pending:
+                            continue
                         try:
                             with PowerSampler(config, energy) as sampler:
                                 ask(
@@ -209,13 +392,24 @@ def evaluate(
                                     question_id="warmup",
                                     mode="warmup",
                                     eval_run_id=run_id,
+                                    precomputed_hits=cached[questions[0].id][0],
+                                    precomputed_retrieval_seconds=cached[questions[0].id][1],
                                 )
                                 try:
                                     sampler.measure_idle(config.baseline_seconds)
                                 except Exception as exc:
                                     sampler.warn(f"Idle baseline unavailable: {exc}")
                                 meta["baselines"][model] = dict(sampler.baselines)
-                                for question in questions:
+                                meta.setdefault("baseline_segments", []).append(
+                                    {
+                                        "model": model,
+                                        "started_at": datetime.now(UTC).isoformat(),
+                                        "baselines": dict(sampler.baselines),
+                                        "question_ids": [q.id for q in pending],
+                                    }
+                                )
+                                write_json(directory / "run.json", meta)
+                                for question in pending:
                                     row = {
                                         "run_id": run_id,
                                         "model": model,
@@ -224,6 +418,7 @@ def evaluate(
                                         "question": question.question,
                                         "expected_sources": list(question.expected_sources),
                                         "out_of_scope": question.out_of_scope,
+                                        "reference_answer": question.reference_answer,
                                     }
                                     try:
                                         answer = ask(
@@ -237,12 +432,22 @@ def evaluate(
                                             question_id=question.id,
                                             mode="eval",
                                             eval_run_id=run_id,
+                                            precomputed_hits=cached[question.id][0],
+                                            precomputed_retrieval_seconds=cached[question.id][1],
                                         )
                                         row.update(
-                                            status="ok",
+                                            status=answer.metrics["status"],
+                                            think=answer.metrics["think"],
                                             answer=answer.text,
                                             metrics=answer.metrics,
                                             **checks(question, answer),
+                                        )
+                                        row.update(
+                                            {
+                                                key: value
+                                                for key, value in by_question[question.id].items()
+                                                if key not in {"question", "reference_answer"}
+                                            }
                                         )
                                         row["retrieved_sources"] = [
                                             [loc.label() for loc in hit.chunk.locations]
@@ -291,10 +496,15 @@ def evaluate(
                         api.unload(judge_model)
         meta["status"] = "partial" if any(r["status"] != "ok" for r in results) else "complete"
     except BaseException:
-        meta["status"] = "interrupted_or_failed"
+        if prepared:
+            meta["status"] = "interrupted_or_failed"
         raise
     finally:
-        meta["completed_answers"] = sum(row["status"] == "ok" for row in results)
-        meta["failed_answers"] = sum(row["status"] != "ok" for row in results)
-        write_json(directory / "run.json", meta)
+        try:
+            if prepared:
+                meta["completed_answers"] = sum(row["status"] == "ok" for row in results)
+                meta["failed_answers"] = sum(row["status"] != "ok" for row in results)
+                write_json(directory / "run.json", meta)
+        finally:
+            run_lock.close()
     return meta

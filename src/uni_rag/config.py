@@ -31,9 +31,11 @@ class Config:
     base_url: str = "http://localhost:11434"
     embedding_model: str = "bge-m3"
     chat_model: str = "qwen3:14b"
-    chat_models: tuple[str, ...] = ("qwen3:4b", "qwen3:14b", "qwen3:30b-a3b")
+    chat_models: tuple[str, ...] = ("qwen3:4b-q4_K_M", "qwen3:14b", "qwen3:30b-a3b-q4_K_M")
     timeout_seconds: float = 180
     context_window: int = 8192
+    num_predict: int = 512
+    answer_max_words: int = 150
     top_k: int = 8
     candidate_k: int = 32
     rrf_constant: int = 60
@@ -41,6 +43,8 @@ class Config:
     power_log: Path = PROJECT_ROOT / "data/power.log"
     baseline_seconds: float = 3
     sample_interval_ms: int = 200
+    max_sample_gap_ms: int = 1000
+    sample_wait_seconds: float = 6
     root: Path = field(default=PROJECT_ROOT, repr=False)
 
     def __post_init__(self) -> None:
@@ -65,6 +69,10 @@ class Config:
             raise ValueError("Invalid size, timeout or minimum slide size")
         if self.context_window < 1024:
             raise ValueError("context_window must be at least 1024 tokens")
+        if self.num_predict < 1 or self.answer_max_words < 1:
+            raise ValueError("num_predict and answer_max_words must be positive")
+        if self.max_sample_gap_ms < self.sample_interval_ms or self.sample_wait_seconds <= 0:
+            raise ValueError("Invalid maximum power-sample gap or wait timeout")
         if self.sample_interval_ms < 1 or self.baseline_seconds < 0:
             raise ValueError("Invalid energy sampling settings")
         if self.energy_backend not in {"auto", "macmon", "powermetrics", "none"}:

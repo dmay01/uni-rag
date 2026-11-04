@@ -1,6 +1,7 @@
 """Local RAG CLI. Nothing executes on import."""
 
 import json
+from dataclasses import replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -65,9 +66,12 @@ def ask(
     file_type: str | None = None,
     path_prefix: str | None = None,
     energy: Annotated[EnergyBackend | None, typer.Option()] = None,
+    num_predict: Annotated[int | None, typer.Option(min=1)] = None,
 ) -> None:
     """Ask a question using local document context and Ollama."""
     cfg = configuration(config)
+    if num_predict is not None:
+        cfg = replace(cfg, num_predict=num_predict)
     run_query(question, cfg, source, model, k, think, show_context, file_type, path_prefix, energy)
 
 
@@ -102,6 +106,14 @@ def run_query(
                 history=history,
             )
         console.print()
+        if answer.metrics.get("thinking_mode_overridden"):
+            console.print(
+                "The installed model is thinking-only; effective think=true was recorded."
+            )
+        if answer.metrics.get("status") == "no_visible_answer":
+            console.print(
+                "The model produced no visible answer within the configured token budget."
+            )
         for line in source_lines(answer):
             console.print(line, markup=False)
         if show_context:
@@ -122,9 +134,12 @@ def chat(
     k: Annotated[int | None, typer.Option(min=1)] = None,
     think: Annotated[bool, typer.Option("--think/--no-think")] = False,
     energy: Annotated[EnergyBackend | None, typer.Option()] = None,
+    num_predict: Annotated[int | None, typer.Option(min=1)] = None,
 ) -> None:
     """Interactive grounded chat. Type /exit or press Ctrl-D to leave."""
     cfg = configuration(config)
+    if num_predict is not None:
+        cfg = replace(cfg, num_predict=num_predict)
     history: list[dict] = []
     console.print("Local chat. /exit to leave; the last three turns stay in memory.")
     while True:
@@ -165,14 +180,29 @@ def eval_command(
     k: Annotated[int | None, typer.Option(min=1)] = None,
     energy: Annotated[EnergyBackend | None, typer.Option()] = None,
     judge_model: str | None = None,
+    num_predict: Annotated[int | None, typer.Option(min=1)] = None,
+    retrieval_run_id: str | None = None,
+    resume_run_id: str | None = None,
 ) -> None:
     """Benchmark local models with warm-up, unloading and optional local judging."""
     from uni_rag.evaluate import evaluate
 
     cfg = configuration(config)
+    if num_predict is not None:
+        cfg = replace(cfg, num_predict=num_predict)
     selected = [name.strip() for name in models.split(",")] if models is not None else None
     try:
-        result = evaluate(cfg, questions, selected, think, k, energy, judge_model)
+        result = evaluate(
+            cfg,
+            questions,
+            selected,
+            think,
+            k,
+            energy,
+            judge_model,
+            retrieval_run_id=retrieval_run_id,
+            resume_run_id=resume_run_id,
+        )
         console.print_json(json.dumps(result))
     except Exception as exc:
         console.print(f"Evaluation failed; completed results are retained: {exc}", markup=False)
@@ -180,14 +210,34 @@ def eval_command(
 
 
 @app.command()
-def report(config: ConfigOption = PROJECT_ROOT / "config.toml", run_id: str | None = None) -> None:
+def report(
+    config: ConfigOption = PROJECT_ROOT / "config.toml",
+    run_id: str | None = None,
+    compare_run_id: str | None = None,
+) -> None:
     """Write a Markdown summary for the latest completed eval (or --run-id)."""
     from uni_rag.report import report as write_report
 
     try:
-        path, text = write_report(configuration(config), run_id)
+        path, text = write_report(configuration(config), run_id, compare_run_id)
         console.print(text, markup=False)
         console.print(f"Written to {path}", markup=False)
     except Exception as exc:
         console.print(f"Report failed: {exc}", markup=False)
+        raise typer.Exit(1) from exc
+
+
+@app.command(name="eval-misses")
+def eval_misses(
+    config: ConfigOption = PROJECT_ROOT / "config.toml", run_id: str | None = None
+) -> None:
+    """List saved strict misses and classify copies/topics locally, without running models."""
+    from uni_rag.eval_misses import diagnose
+
+    try:
+        path, text = diagnose(configuration(config), run_id)
+        console.print(text, markup=False)
+        console.print(f"Written to {path}", markup=False)
+    except Exception as exc:
+        console.print(f"Miss diagnostics failed: {exc}", markup=False)
         raise typer.Exit(1) from exc

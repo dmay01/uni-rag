@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
 
+from uni_rag.answer_quality import VisibleText, quality
 from uni_rag.config import Config
 from uni_rag.energy import PowerSampler
 from uni_rag.metrics.recorder import record
@@ -63,11 +64,16 @@ def ask(
     mode: str = "ask",
     eval_run_id: str | None = None,
     history: list[dict] | None = None,
+    precomputed_hits: list[Hit] | None = None,
+    precomputed_retrieval_seconds: float | None = None,
 ) -> Answer:
     if not question.strip():
         raise ValueError("Question must not be empty")
     owned_sampler = sampler is None
     sampler = sampler or PowerSampler(config, energy)
+    sampler.prepare()
+    effective_think = client.thinking_mode(model or config.chat_model, think)
+    model_digest = client.digest(model or config.chat_model)
     wall_start, start = time.time(), time.perf_counter()
     metric = {
         "query_id": str(uuid.uuid4()),
@@ -76,9 +82,19 @@ def ask(
         "eval_run_id": eval_run_id,
         "started_at": datetime.fromtimestamp(wall_start, UTC).isoformat(),
         "model": model or config.chat_model,
+        "model_digest": model_digest,
         "embedding_model": config.embedding_model,
         "context_window": config.context_window,
-        "think": think,
+        "num_predict": config.num_predict,
+        "answer_max_words": config.answer_max_words,
+        "retrieval_mode": "shared_precomputed" if precomputed_hits is not None else "live",
+        "precomputed_retrieval_seconds": precomputed_retrieval_seconds,
+        "think": effective_think,
+        "think_requested": think,
+        "thinking_mode_overridden": effective_think != think,
+        "model_identity": client.model_info.get(model or config.chat_model, {})
+        .get("model_info", {})
+        .get("general.finetune", "hybrid_or_unspecified"),
         "k": config.top_k if k is None else k,
         "status": "error",
         "retrieval_seconds": None,
@@ -97,11 +113,20 @@ def ask(
         retrieval_question = question + (
             "\nEarlier questions: " + "\n".join(recent) if recent else ""
         )
-        hits = retrieve(retrieval_question, config, client, k, source, file_type, path_prefix)
+        hits = (
+            precomputed_hits
+            if precomputed_hits is not None
+            else retrieve(retrieval_question, config, client, k, source, file_type, path_prefix)
+        )
         retrieved = time.perf_counter()
         metric["retrieval_seconds"] = retrieved - start
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT
+                + f"\nUse at most about {config.answer_max_words} words. Answer directly, "
+                "once; omit repeated conclusions and internal deliberation.",
+            },
             {
                 "role": "user",
                 "content": "Conversation for question interpretation only (not evidence):\n"
@@ -111,11 +136,22 @@ def ask(
         ]
         done = {}
         first_event = None
+        visible = VisibleText()
+        thinking_tokens, answer_tokens, logged_tokens = 0, 0, 0
+        thought_parts = []
         for event in client.chat(messages, model or config.chat_model, think):
             message = event.get("message", {})
+            if message.get("thinking"):
+                thought_parts.append(message["thinking"])
+            token_count = len(event.get("logprobs") or [])
+            logged_tokens += token_count
+            if message.get("thinking") and not message.get("content"):
+                thinking_tokens += token_count
+            elif message.get("content") and not message.get("thinking"):
+                answer_tokens += token_count
             if first_event is None and (message.get("content") or message.get("thinking")):
                 first_event = time.perf_counter()
-            content = message.get("content", "")
+            content = visible.feed(message.get("content", ""), final=bool(event.get("done")))
             if content:
                 if metric["ttft_seconds"] is None:
                     metric["ttft_seconds"] = time.perf_counter() - start
@@ -124,16 +160,31 @@ def ask(
                     on_token(content)
             if event.get("done"):
                 done = event
-        if not done or not parts:
-            raise RuntimeError("Ollama stream ended without a final event or visible answer")
+        if not done:
+            raise RuntimeError("Ollama stream ended without a final event")
         end = time.perf_counter()
         duration = done.get("eval_duration")
         count = done.get("eval_count")
+        # Content containing leaked thought markup cannot be split reliably by API event labels.
+        split_available = bool(
+            logged_tokens
+            and count is not None
+            and count >= logged_tokens
+            and not visible.think_tags_seen
+        )
+        thought_quality = quality("".join(thought_parts))
         metric.update(
             {
-                "status": "ok",
+                "status": "ok" if "".join(parts).strip() else "no_visible_answer",
                 "prompt_tokens": done.get("prompt_eval_count"),
                 "completion_tokens": count,
+                "thinking_tokens": thinking_tokens if split_available else None,
+                "answer_tokens": answer_tokens if split_available else None,
+                "unattributed_completion_tokens": count - thinking_tokens - answer_tokens
+                if split_available
+                else None,
+                "token_split_method": "ollama_stream_logprobs" if split_available else None,
+                "thinking_repetition_flag": thought_quality["repetition_flag"],
                 "generation_seconds": end - retrieved,
                 "tokens_per_second": count / (duration / 1e9)
                 if count is not None and duration and duration > 0
@@ -144,6 +195,9 @@ def ask(
                 else None,
                 "citation_ids": sorted(cited_numbers("".join(parts))),
                 "done_reason": done.get("done_reason"),
+                "thought_markup_suppressed": visible.think_tags_seen,
+                "output_truncated": done.get("done_reason") == "length",
+                **quality("".join(parts)),
             }
         )
     except BaseException as exc:

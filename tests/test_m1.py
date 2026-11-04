@@ -16,7 +16,19 @@ from uni_rag.ollama import Ollama
 
 
 def transport(request: httpx.Request) -> httpx.Response:
+    if request.url.path == "/api/tags":
+        return httpx.Response(
+            200,
+            json={
+                "models": [
+                    {"name": model, "digest": "a" * 64}
+                    for model in ("qwen3:4b", "qwen3:14b", "qwen3:30b-a3b", "local-judge")
+                ]
+            },
+        )
     payload = json.loads(request.content)
+    if request.url.path == "/api/show":
+        return httpx.Response(200, json={"model_info": {}})
     if request.url.path == "/api/embed":
         return httpx.Response(200, json={"embeddings": [[1.0, 0.5, 0.1] for _ in payload["input"]]})
     assert payload["think"] is False

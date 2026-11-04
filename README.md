@@ -12,9 +12,9 @@ export UV_CACHE_DIR="$PWD/.cache/uv"
 export UV_PYTHON_INSTALL_DIR="$PWD/.cache/python"
 uv sync --locked
 ollama pull bge-m3
-ollama pull qwen3:4b
+ollama pull qwen3:4b-q4_K_M
 ollama pull qwen3:14b
-ollama pull qwen3:30b-a3b
+ollama pull qwen3:30b-a3b-q4_K_M
 cp config.example.toml config.toml
 ```
 
@@ -97,8 +97,8 @@ Development and tests use only original synthetic fixtures. They never load `con
 
 ## Results
 
-No benchmark has been run against personal documents. `rag report` will write a filled table
-under `data/reports/` for manual inclusion here.
+Benchmark results stay local. `rag report` writes a filled table under `data/reports/`
+for manual inclusion here; the repository table stays empty.
 
 | Model | Think | Queries | Median latency (s) | Median TTFT (s) | Tokens/s | Gross J/answer | Above-idle J/answer | Hit@k |
 |---|---|---|---|---|---|---|---|---|
@@ -154,9 +154,26 @@ uv run rag ask "What is MRR?" --energy auto --no-think
 Every attempted query writes a JSONL record to `data/metrics/`: model, think setting,
 question ID, query ID, k, retrieval time, visible-answer TTFT, total query time, prompt and
 completion tokens, and decode tokens/s from Ollama's `eval_count/eval_duration`. Total time
-covers retrieval through the final streamed event. The first model token is recorded
+covers retrieval through the final streamed event for ask/chat. The first model token is recorded
 separately from visible TTFT when thinking is enabled. No token counts are inferred when
 Ollama does not provide them. Metrics contain no question or document text.
+
+`[ollama] num_predict = 512` sets the total output-token cap, including thinking; override it
+with `--num-predict` on ask, chat or eval. `[ollama] answer_max_words = 150` sets the concise
+answer instruction. Both values are recorded with every query. Streaming `<think>` blocks
+are suppressed, and metrics flag repetition, truncation and missing visible answers.
+
+Exact model tags and SHA256 digests come from the local Ollama model list and are recorded
+per query and per run. Tags can change their meaning: some `qwen3:4b` and `qwen3:30b-a3b`
+installations contain Thinking-2507 weights. Those cannot reliably disable reasoning. The
+CLI records requested and effective thinking separately and warns about that mismatch.
+Use explicit original hybrid tags (`qwen3:4b-q4_K_M`, `qwen3:30b-a3b-q4_K_M`) for a
+non-thinking comparison with the original 14b model; check the local metadata after pulling.
+
+When available, stream logprobs supply exact thinking-token and visible-answer-token counts.
+Delimiter/control tokens omitted by Ollama's parser stay in an unattributed-token count;
+the components sum to Ollama's total completion count. If token logprobs are absent, split
+counts stay null. Hidden reasoning text is never saved in query metrics or eval answers.
 
 Set `[energy] energy_backend = "auto"` in config, or override it with
 `--energy auto|macmon|powermetrics|none`. Auto starts macmon's JSON `pipe` mode, then tries an
@@ -172,7 +189,16 @@ Power measurements sum CPU, GPU and ANE, in watts; this is not whole-system/batt
 All three components must be present. Readings integrate by the trapezoidal rule, with
 interpolation only between adjacent measured points covering the entire query window.
 Missing endpoints, gaps, stale logs and sampler failures produce null, with a warning;
-no power is extrapolated. Powermetrics headers can have one-second timestamp precision:
+no power is extrapolated. `[energy] max_sample_gap_ms = 1000` bounds interpolation between
+measured points, allowing scheduling jitter around the requested 200 ms cadence. This is
+an explicit change from the earlier hard-coded 350 ms limit. Each metric records the bound,
+observed maximum gap, sample count, timestamps and coverage-failure reason. Gaps exceeding
+the bound still produce null. `[energy] sample_wait_seconds = 6` bounds the wait for a
+trailing sample. Malformed records are skipped, exited/stalled samplers restart between
+queries, and a complete measured window remains usable if the sampler exits afterward.
+Per-query warnings do not inherit previous coverage failures. Timestamped measured watts
+and receipt times are retained in `data/logs/macmon-*.jsonl`; stderr is retained on failures.
+Powermetrics headers can have one-second timestamp precision:
 readings sharing a timestamp are averaged, and the observed interval is recorded separately
 from the requested 200 ms interval. Use macmon for finer timestamp alignment.
 
@@ -191,11 +217,11 @@ Copy the example to create your own private question set (the example uses fixtu
 cp eval/questions.example.yaml eval/questions.yaml
 uv run rag eval --config tests/fixtures.config.toml \
   --questions eval/questions.example.yaml \
-  --models qwen3:4b,qwen3:14b,qwen3:30b-a3b --energy auto --no-think
+  --models qwen3:4b-q4_K_M,qwen3:14b,qwen3:30b-a3b-q4_K_M --energy auto --no-think
 uv run rag report --config tests/fixtures.config.toml
 # For your private corpus, edit eval/questions.yaml, then run without --config:
 uv run rag eval --questions eval/questions.yaml \
-  --models qwen3:4b,qwen3:14b,qwen3:30b-a3b
+  --models qwen3:4b-q4_K_M,qwen3:14b,qwen3:30b-a3b-q4_K_M
 uv run rag report
 ```
 
@@ -205,8 +231,12 @@ Keep private question sets under `data/` (recommended), or use the ignored
 An empty expected list marks an out-of-scope question; `out_of_scope: true` can make this
 explicit. The loader also accepts `expected_source_substrings`.
 
-Selected models are unloaded before the benchmark. Each model gets one full retrieval/answer
-warm-up before its idle baseline and measured questions, then is unloaded with `keep_alive: 0`.
+Selected models are unloaded before the benchmark. Retrieval runs once per question and is
+saved in `retrieval.jsonl`; every model receives identical precomputed excerpts. Generation
+latency, TTFT and energy exclude that separate retrieval phase. These measurements are not
+directly comparable with legacy runs that included repeated retrieval in each answer.
+Each model gets one answer warm-up before its idle baseline and measured questions, then
+is unloaded with `keep_alive: 0`.
 Warm-up metrics are labelled and excluded from results. Other applications and system activity
 can still affect measurements; no inference is made about whole-machine battery usage.
 Model labels describe small dense (4b), medium dense (14b), and mixture-of-experts (30b-a3b).
@@ -224,9 +254,55 @@ they do not invalidate measured answers. No remote judge is supported.
 
 `rag report` writes `data/reports/summary.md` for the latest completed/partial eval run.
 Use `--run-id ID` to select a particular run (including interrupted runs). It reports medians
-for latency, visible TTFT, decode throughput and energy, plus hit@k/MRR and answer checks.
-Energy backends are grouped separately and the count of covered answers is shown. Missing
-measurements remain `—`. Copy the resulting table into the empty Results section above.
+for completion tokens, latency, visible TTFT, decode throughput, joules/answer and paired
+joules/output token. Each model aggregates across energy backends, with covered energy n
+and an explicit warning for incomplete coverage. The separate retrieval table deduplicates
+questions and shows strict/lenient Hit@k and MRR once. Missing measurements remain `—`.
+Reports are also saved with each run. A timestamp prefix is accepted if it identifies one run.
+
+Strict source matching respects PDF page and merged-slide boundaries. Lenient matching also
+accepts a different document with the same normalized filename stem (case, separators,
+accents and common copy/version suffixes removed), or full indexed-document five-word-shingle
+Dice similarity ≥0.95. This requested filename rule is broad: similarly named documents may
+be false positives. Match methods and text similarities are retained for review. A different
+page in the same file is not classified as a duplicate file. Existing multi-doc questions
+continue to use the evaluator's any-expected-source Hit@k rule.
+
+```sh
+uv run rag eval-misses --run-id 20261101T170350Z
+```
+
+This local diagnostic uses saved top-8 rankings and indexed text, without new model calls or
+source-folder reads. Each strict miss lists expected and retrieved paths and is classified
+as another version/copy, a different document on the right topic, or unrelated. The latter
+two are explicitly labelled lexical heuristics needing review, not semantic judgments.
+Markdown and JSON diagnostics stay under `data/reports/`.
+
+For a separate reasoning-cost experiment, use explicit Thinking-2507 tags with `--think
+--num-predict 4096`, then combine it with the main run:
+
+```sh
+uv run rag eval --questions eval/questions.yaml \
+  --models qwen3:4b-thinking-2507-q4_K_M,qwen3:30b-a3b-thinking-2507-q4_K_M \
+  --think --num-predict 4096 --retrieval-run-id MAIN_RUN
+uv run rag report --run-id MAIN_RUN --compare-run-id THINKING_RUN
+```
+
+`--retrieval-run-id` reuses the main run's saved chunk IDs, metadata and retrieval scores;
+it verifies compatible question hashes/settings and rejects changed or missing chunks.
+The comparison report also checks that both runs used identical retrieved contexts.
+
+`--resume-run-id RUN` continues an interrupted experiment with the same models and
+options. It validates the question hash, settings and model digests, retains completed
+rows, and reuses the saved context. Each resumed segment gets a fresh warm-up and idle
+baseline; the segment boundaries are recorded in `run.json`. A process lock prevents
+simultaneous writers to the same run.
+
+The thinking table reports measured thinking/answer/control token splits, latency, TTFT,
+joules/answer, coverage and citation checks alongside the shared retrieval scores. It flags
+answers that exhaust the cap without visible output. Comparing original hybrid and
+Thinking-2507 weights measures two deployment choices at the same model size; different
+weight releases mean this is not an isolated on/off test of reasoning on identical weights.
 
 Runtime direct dependencies: Typer, Rich, HTTPX, LanceDB, PyArrow, BM25s (indexing extra),
 PyMuPDF 1.x, python-pptx, python-docx and PyYAML. Development adds Ruff and pytest.

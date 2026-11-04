@@ -60,24 +60,27 @@ def test_auto_falls_back_only_for_log_with_query_coverage(cfg, monkeypatch):
     with PowerSampler(cfg, "auto") as sampler:
         result = sampler.measure(10.1, 10.9)
         assert result["energy_backend"] == "powermetrics"
+        assert result["energy_max_allowed_gap_ms"] == 1250
         assert result["energy_gross_joules"] == pytest.approx(3.2)
         assert result["energy_above_baseline_joules"] is None
         sampler.baselines["powermetrics"] = 2
         assert sampler.measure(10.1, 10.9)["energy_above_baseline_joules"] == pytest.approx(1.6)
-        ticks = iter([0, 2])
+        ticks = iter([0, 20])
         monkeypatch.setattr(energy.time, "monotonic", lambda: next(ticks))
         result = sampler.measure(100, 101)
         assert result["energy_backend"] == "none" and result["energy_gross_joules"] is None
 
 
-def test_failed_live_sampling_cannot_use_partial_samples(cfg, monkeypatch):
+def test_complete_window_survives_later_sampler_failure(cfg, monkeypatch):
 
     monkeypatch.setattr(PowerSampler, "_start_macmon", lambda self: None)
     with PowerSampler(cfg, "macmon") as sampler:
         sampler.samples.extend([Sample(0, 2), Sample(0.2, 2)])
         sampler.failed = True
         result = sampler.measure(0.01, 0.19)
-    assert result["energy_gross_joules"] is None
+        incomplete = sampler.measure(0.01, 0.3)
+    assert result["energy_gross_joules"] == pytest.approx(0.36)
+    assert incomplete["energy_gross_joules"] is None
 
 
 def test_query_metrics_and_power_failure_are_nonfatal(cfg, monkeypatch):

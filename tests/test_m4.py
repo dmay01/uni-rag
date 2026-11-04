@@ -19,7 +19,11 @@ EXAMPLES = Path(__file__).parents[1] / "eval/questions.example.yaml"
 
 def evaluation_transport(actions):
     def respond(request):
+        if request.url.path == "/api/tags":
+            return transport(request)
         payload = json.loads(request.content)
+        if request.url.path == "/api/show":
+            return transport(request)
         if request.url.path == "/api/generate":
             assert payload["keep_alive"] == 0
             actions.append(("unload", payload["model"]))
@@ -154,6 +158,8 @@ def test_chat_history_and_mode_stay_local(cfg, monkeypatch):
     calls = []
 
     def history_transport(request):
+        if request.url.path == "/api/tags":
+            return transport(request)
         payload = json.loads(request.content)
         if request.url.path == "/api/chat":
             calls.append(payload["messages"][-1]["content"])
