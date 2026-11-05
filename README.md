@@ -3,6 +3,20 @@
 A fully local, transparent RAG assistant for German and English university material.
 Python 3.12, Ollama, LanceDB and an explicit parsing/retrieval pipeline; no LangChain or LlamaIndex.
 
+**v0.1 results** on a MacBook Pro M5 over about 4,300 of my own files
+(60 questions; details in [Results](#results-v01)):
+
+- **Retrieval is the main limitation:** the expected source is in the top 8 for
+  20 of 45 answerable questions. When it is retrieved, the 14B and 30B models
+  cite it in 18 of 20 cases.
+- **Mixture-of-experts wins on this laptop:** Qwen3-30B-A3B answers 2.7× faster
+  than dense Qwen3-14B with about half the energy per answer (185 vs 362 J) and
+  the same citation rate.
+- **Thinking costs 2.8–5.5× the energy per answer** and did not improve the 30B
+  model's citations.
+- **Next (v0.2):** reranking and per-document diversity in retrieval, measured
+  on the same questions.
+
 ## Setup
 
 Install uv and Ollama, then install the project and local models:
@@ -200,7 +214,7 @@ recorded separately, so the displayed component medians need not sum to a total-
    configuration and produced about 1.8× as many reasoning tokens as 30B;
    this is not a causal isolation of reasoning cost.
 
-### Limitations
+### Benchmark caveats
 
 - One machine, one run per configuration (one thinking run resumed), medians without
   confidence intervals. With 45 answerable questions, one question is 2.2 percentage points.
